@@ -1,0 +1,295 @@
+"""
+后台 Worker 模块 — UI/Worker 分离架构的核心。
+
+提供：
+    _atomic_write_json — 原子写入 JSON 文件（先写 tmp 再 os.replace）
+    WorkerStatus       — Worker 状态快照
+    WorkerManager      — 后台 Worker 管理器（单例）
+
+原子写入保证在网络断开、进程被杀等异常情况下 progress.json 不损坏。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+PROGRESS_FILE = "progress.json"
+
+
+def _atomic_write_json(filepath: str, data: dict) -> None:
+    """原子写入 JSON 文件。
+
+    先写入临时文件，再通过 os.replace 原子替换到目标路径。
+    保证在任何时刻中断（断电、kill）都不会产生损坏的 JSON 文件。
+
+    Args:
+        filepath: 目标文件路径（如 "progress.json"）。
+        data: 要写入的字典数据。
+    """
+    tmp_path = filepath + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp_path, filepath)
+
+
+@dataclass
+class WorkerStatus:
+    """Worker 当前状态的快照。
+
+    Attributes:
+        state: "idle" | "running" | "paused" | "completed" | "error"
+        total_asins: 总 ASIN 数。
+        completed_asins: 已完成 ASIN 数。
+        total_images: 总图片数。
+        processed_images: 已处理图片数。
+        current_asin: 当前正在处理的 ASIN。
+        started_at: 开始时间 ISO 字符串。
+        updated_at: 最后更新时间 ISO 字符串。
+        error: 错误信息（state=error 时非空）。
+    """
+    state: str = "idle"
+    total_asins: int = 0
+    completed_asins: int = 0
+    total_images: int = 0
+    processed_images: int = 0
+    current_asin: str = ""
+    started_at: str = ""
+    updated_at: str = ""
+    error: str = ""
+
+
+class WorkerManager:
+    """后台 Worker 管理器（单例）。
+
+    UI/Worker 分离的核心桥梁：
+    - start(): 启动后台 asyncio task（不依赖 Streamlit WebSocket）
+    - get_status(): 读 progress.json 返回 WorkerStatus
+    - pause()/resume(): 控制任务暂停/恢复
+    - 线程安全：progress.json 原子写入（先写 tmp 再 os.replace）
+    """
+
+    _instance: WorkerManager | None = None
+
+    @classmethod
+    def reset(cls) -> None:
+        """重置单例（仅用于测试）。"""
+        if cls._instance is not None:
+            cls._instance._initialized = False
+        cls._instance = None
+
+    def __new__(cls) -> WorkerManager:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self) -> None:
+        if self._initialized:
+            return
+        self._initialized = True
+        self._state = "idle"
+        self._total_asins = 0
+        self._completed_asins = 0
+        self._total_images = 0
+        self._processed_images = 0
+        self._current_asin = ""
+        self._started_at = ""
+        self._error = ""
+        self._task: asyncio.Task | None = None
+        self._result: object = None  # BatchImageResult，完成后存储
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()  # 初始为未暂停状态
+        self._lock = threading.Lock()
+
+    def start(
+        self,
+        products: list[dict],
+        font_config=None,
+        *,
+        _download_func: Callable | None = None,
+        _ocr_func: Callable | None = None,
+        _translate_func: Callable | None = None,
+        _repair_func: Callable | None = None,
+        _resize_func: Callable | None = None,
+        _upload_func: Callable | None = None,
+    ) -> None:
+        """启动后台翻译任务。
+
+        在独立的 asyncio task 中运行，不阻塞调用方。
+        任务独立于 Streamlit WebSocket 生命周期。
+
+        Args:
+            products: 产品列表。
+            font_config: 字体配置。
+            _*_func: 测试注入用。
+        """
+        from datetime import datetime as _dt
+
+        # 新运行前清除旧的 progress.json
+        if os.path.isfile(PROGRESS_FILE):
+            os.remove(PROGRESS_FILE)
+
+        with self._lock:
+            self._state = "running"
+            self._total_asins = len(products)
+            self._completed_asins = 0
+            self._started_at = _dt.now().isoformat()
+            self._error = ""
+            self._pause_event.set()
+
+        # 在后台启动 asyncio task
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 没有运行中的 event loop，创建一个新的
+            loop = asyncio.new_event_loop()
+
+        self._task = loop.create_task(
+            self._run(
+                products=products,
+                font_config=font_config,
+                _download_func=_download_func,
+                _ocr_func=_ocr_func,
+                _translate_func=_translate_func,
+                _repair_func=_repair_func,
+                _resize_func=_resize_func,
+                _upload_func=_upload_func,
+            )
+        )
+
+    async def _run(
+        self,
+        products: list[dict],
+        font_config,
+        *,
+        _download_func=None,
+        _ocr_func=None,
+        _translate_func=None,
+        _repair_func=None,
+        _resize_func=None,
+        _upload_func=None,
+    ) -> None:
+        """后台执行批量翻译（内部方法）。"""
+        from image_translator import translate_batch
+
+        try:
+            result = await translate_batch(
+                products=products,
+                font_config=font_config,
+                progress_callback=self._on_asin_complete,
+                resume_from=PROGRESS_FILE,
+                _download_func=_download_func,
+                _ocr_func=_ocr_func,
+                _translate_func=_translate_func,
+                _repair_func=_repair_func,
+                _resize_func=_resize_func,
+                _upload_func=_upload_func,
+            )
+            with self._lock:
+                self._state = "completed"
+                self._completed_asins = result.completed_asins
+                self._total_images = result.total_images
+                self._processed_images = result.success_images
+                self._result = result
+        except Exception as e:
+            with self._lock:
+                self._state = "error"
+                self._error = str(e)
+
+    def _on_asin_complete(self, asin_result) -> None:
+        """单个 ASIN 完成后的回调（由 translate_batch 调用）。"""
+        with self._lock:
+            self._completed_asins += 1
+            self._current_asin = asin_result.asin
+            self._total_images += len(asin_result.images)
+            self._processed_images += asin_result.success_count
+
+    def pause(self) -> None:
+        """暂停后台 Worker。"""
+        self._pause_event.clear()
+
+    def resume(self) -> None:
+        """恢复后台 Worker。"""
+        self._pause_event.set()
+
+    def get_status(self) -> WorkerStatus:
+        """获取当前 Worker 状态快照。
+
+        Returns:
+            WorkerStatus 包含当前进度、状态等信息。
+        """
+        with self._lock:
+            return WorkerStatus(
+                state=self._state,
+                total_asins=self._total_asins,
+                completed_asins=self._completed_asins,
+                total_images=self._total_images,
+                processed_images=self._processed_images,
+                current_asin=self._current_asin,
+                started_at=self._started_at,
+                error=self._error,
+            )
+
+    def get_result(self):
+        """获取批量处理结果（仅在 state=completed 时有值）。
+
+        Returns:
+            BatchImageResult 或 None。
+        """
+        with self._lock:
+            return self._result
+
+    def run_sync(
+        self,
+        products: list[dict],
+        font_config=None,
+        *,
+        _download_func=None,
+        _ocr_func=None,
+        _translate_func=None,
+        _repair_func=None,
+        _resize_func=None,
+        _upload_func=None,
+    ):
+        """同步运行批量翻译（阻塞当前线程直到完成）。
+
+        用于 Streamlit UI 等需要等待结果的场景。
+
+        Returns:
+            BatchImageResult。
+        """
+        import asyncio as _asyncio
+
+        from datetime import datetime as _dt
+
+        # 新运行前清除旧的 progress.json，避免上一轮的 completed_asins
+        # 导致所有 ASIN 被跳过
+        if os.path.isfile(PROGRESS_FILE):
+            os.remove(PROGRESS_FILE)
+
+        with self._lock:
+            self._state = "running"
+            self._total_asins = len(products)
+            self._completed_asins = 0
+            self._started_at = _dt.now().isoformat()
+            self._error = ""
+            self._result = None
+
+        _asyncio.run(
+            self._run(
+                products=products,
+                font_config=font_config,
+                _download_func=_download_func,
+                _ocr_func=_ocr_func,
+                _translate_func=_translate_func,
+                _repair_func=_repair_func,
+                _resize_func=_resize_func,
+                _upload_func=_upload_func,
+            )
+        )
+        return self._result

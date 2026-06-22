@@ -1,0 +1,55 @@
+# ============================================================
+# WB Content Tool — Python 依赖
+# 安装: pip install -r requirements.txt
+# （安装脚本使用清华镜像加速下载）
+# ============================================================
+
+# Web 界面
+streamlit>=1.28
+
+# HTML 解析
+beautifulsoup4>=4.12
+lxml>=5.1
+
+# Excel 读写
+openpyxl>=3.1
+
+# 数据处理
+pandas>=2.1
+
+# HTTP 请求（ScraperAPI 模式使用）
+httpx>=0.27
+
+# AI API 调用
+openai>=1.12
+anthropic>=0.25
+
+# 环境变量管理
+python-dotenv>=1.0
+
+# 数据模型验证
+pydantic>=2.5
+
+# ==== 图片翻译 ====
+
+# OCR 文字检测与定位
+paddleocr>=2.8
+paddlepaddle>=3.0
+
+# 图片处理
+Pillow>=10.0
+
+# R2 对象存储（S3 兼容）
+boto3>=1.35
+
+# AI 图片修复
+replicate>=1.0
+
+# ==== 可选依赖 ====
+# Playwright 模式（不使用 ScraperAPI 时需要）
+# 安装后需运行: playwright install chromium
+# playwright>=1.40
+
+# 测试（开发用）
+# pytest>=8.0
+# pytest-asyncio>=0.24

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+*.xlsx
+!sample_*.xlsx
+_output.txt
+_docx_output.txt
+
+# Temp / Debug
+_temp_output.txt
+debug_*.png
+
+# Test
+.pytest_cache/
+
+# Claude
+.claude/
