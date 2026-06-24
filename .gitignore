@@ -32,3 +32,12 @@ debug_*.png
 
 # Claude
 .claude/
+
+# Runtime artifacts
+progress.json
+card_progress.json
+card_image_progress.json
+products.db
+html/
+images/
+r2_storage.py

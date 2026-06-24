@@ -53,6 +53,7 @@ from worker import (
     start_background_card_generation,
     start_background_translation,
 )
+from workflow_ui import render_workflow_tab
 
 # ============================================================
 # 页面配置
@@ -569,11 +570,103 @@ with st.sidebar:
     else:
         st.warning("⚠️ R2 未配置，图片将保存到本地")
 
+    st.divider()
+
+    # --- 系统状态面板 ---
+    with st.expander("🔧 系统状态", expanded=False):
+        st.caption("各组件可用性检测（点击展开）")
+
+        # 1. .env 配置
+        if os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
+            p1_configured = bool(settings.phase1_api_key)
+            p2_configured = bool(settings.phase2_api_key)
+            gemini_configured = bool(settings.gemini_api_key)
+            r2_configured = bool(settings.r2_access_key_id)
+
+            if p1_configured:
+                st.success("✅ Phase 1 API 已配置")
+            else:
+                st.warning("⚠️ Phase 1 API 未配置 — 信息萃取和图片翻译不可用")
+
+            if p2_configured or p1_configured:
+                st.success("✅ Phase 2 API " + ("已独立配置" if p2_configured else "复用 Phase 1"))
+            else:
+                st.warning("⚠️ Phase 2 API 未配置 — 文案生成不可用")
+
+            if gemini_configured or settings.image_gen_api_key:
+                st.success("✅ AI 图片 API 已配置")
+            else:
+                st.info("ℹ️ AI 图片 API 未配置 — AI 图片管线不可用")
+
+            if r2_configured:
+                st.success("✅ R2 图片存储已配置")
+            else:
+                st.info("ℹ️ R2 未配置 — 图片仅保存在本地")
+        else:
+            st.warning("⚠️ .env 文件未找到 — 请点击「💾 保存配置」生成")
+
+        # 2. Playwright
+        @st.cache_resource(show_spinner=False)
+        def _check_playwright():
+            try:
+                from playwright.sync_api import sync_playwright
+                p = sync_playwright().start()
+                b = p.chromium.launch(headless=True)
+                b.close()
+                p.stop()
+                return True, ""
+            except Exception as e:
+                return False, str(e)
+
+        pw_ok, pw_err = _check_playwright()
+        if pw_ok:
+            st.success("✅ Playwright 浏览器 — 爬虫可用")
+        else:
+            st.warning(f"⚠️ Playwright 浏览器不可用 — 爬虫请使用 ScraperAPI 模式")
+
+        # 3. PaddleOCR
+        @st.cache_resource(show_spinner=False)
+        def _check_paddleocr():
+            try:
+                from paddleocr import PaddleOCR
+                ocr = PaddleOCR(lang="en", show_log=False)
+                return True, ""
+            except Exception as e:
+                return False, str(e)
+
+        ocr_ok, ocr_err = _check_paddleocr()
+        if ocr_ok:
+            st.success("✅ PaddleOCR — 传统图片翻译可用")
+        else:
+            st.warning("⚠️ PaddleOCR 不可用 — 传统图片翻译管线不可用，请使用 AI 管线")
+
+        # 4. 字体
+        font_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+        if os.path.isdir(font_dir) and os.listdir(font_dir):
+            st.success(f"✅ 字体文件 — {', '.join(os.listdir(font_dir)[:3])}")
+        else:
+            st.info("ℹ️ 字体目录为空 — 可在图片翻译 Tab 中指定系统字体")
+
+        # 5. 网络
+        @st.cache_data(show_spinner=False, ttl=60)
+        def _check_network():
+            try:
+                import urllib.request
+                urllib.request.urlopen("https://www.baidu.com", timeout=5)
+                return True
+            except Exception:
+                return False
+
+        if _check_network():
+            st.success("✅ 网络连接正常")
+        else:
+            st.error("❌ 网络不可达 — AI API 调用将失败")
+
 # ============================================================
 # 主区域 — Tab 布局
 # ============================================================
 
-tab1, tab2, tab3, tab4 = st.tabs(["🕷️ 爬虫采集", "📝 文案翻译", "🖼️ 图片翻译", "🎨 产品卡片设计"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🕷️ 爬虫采集", "📝 文案翻译", "🖼️ 图片翻译", "🎨 产品卡片设计", "🔄 工作流"])
 
 # ---------- Tab 1: 爬虫采集 ----------
 
@@ -1965,3 +2058,8 @@ with tab4:
                 "💡 每张卡片由 AI 独立生成，设计风格保持一致但细节可能略有差异。"
                 "生成图片已上传至 R2 对象存储，关闭页面后仍可访问。"
             )
+
+# ---------- Tab 5: 工作流 ----------
+
+with tab5:
+    render_workflow_tab(DB_PATH, html_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)), "html"))
