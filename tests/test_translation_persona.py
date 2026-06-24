@@ -41,9 +41,9 @@ class TestPersonaContent:
     """验证 prompt 包含从 docx 提取的核心人设内容。"""
 
     def test_contains_role_definition(self):
-        """应定义 AI 角色为跨境电商本地化专家"""
+        """应定义 AI 角色为 Wildberries 俄语电商文案优化师"""
         content = _load_prompt()
-        assert "跨境电商本地化专家" in content, "缺少角色定义"
+        assert "Wildberries 俄语电商文案优化师" in content, "缺少角色定义"
 
     def test_contains_wildberries_reference(self):
         """应提及目标平台 Wildberries"""

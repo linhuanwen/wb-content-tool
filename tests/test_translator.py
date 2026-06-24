@@ -95,11 +95,11 @@ class TestLoadSystemPrompt:
         assert len(prompt.strip()) > 0
 
     def test_contains_persona_content(self):
-        """加载的内容包含角色定义（跨境电商本地化专家）"""
+        """加载的内容包含角色定义（Wildberries 俄语电商文案优化师）"""
         from translator import _load_system_prompt
 
         prompt = _load_system_prompt()
-        assert "跨境电商本地化专家" in prompt
+        assert "Wildberries 俄语电商文案优化师" in prompt
 
     def test_contains_json_format_instruction(self):
         """加载的内容包含 JSON 输出格式指令"""
@@ -132,34 +132,34 @@ class TestPostProcessTitle:
 
     def test_lowercases_title(self):
         """标题转为全小写"""
-        from translator import _post_process_title
+        from text_utils import post_process_title
 
-        result = _post_process_title("Масляный Насос для Авто")
+        result = post_process_title("Масляный Насос для Авто")
         assert result == "масляный насос для авто"
 
     def test_truncates_to_60_chars(self):
         """超过 60 字符的标题被截断"""
-        from translator import _post_process_title
+        from text_utils import post_process_title
 
         long_title = "а" * 80  # 80 个俄语字符
-        result = _post_process_title(long_title)
+        result = post_process_title(long_title)
         assert len(result) <= 60
         assert result == "а" * 60
 
     def test_keeps_title_under_60_unchanged_length(self):
         """60 字符以内的标题长度不变（除小写外）"""
-        from translator import _post_process_title
+        from text_utils import post_process_title
 
         title = "бутылка для масла стеклянная с распылителем"  # ~47 chars
-        result = _post_process_title(title)
+        result = post_process_title(title)
         assert len(result) <= 60
         assert result == title.lower()
 
     def test_removes_special_characters(self):
         """去除特殊符号，保留字母、数字、空格"""
-        from translator import _post_process_title
+        from text_utils import post_process_title
 
-        result = _post_process_title("масляный насос!!! (премиум) #1")
+        result = post_process_title("масляный насос!!! (премиум) #1")
         # 感叹号、括号、井号应被移除
         assert "!" not in result
         assert "(" not in result
@@ -173,32 +173,32 @@ class TestPostProcessTitle:
 
     def test_strips_whitespace(self):
         """去除首尾空格"""
-        from translator import _post_process_title
+        from text_utils import post_process_title
 
-        result = _post_process_title("  масляный насос  ")
+        result = post_process_title("  масляный насос  ")
         assert result == "масляный насос"
         assert not result.startswith(" ")
         assert not result.endswith(" ")
 
     def test_handles_empty_title(self):
         """空标题返回空字符串，不崩溃"""
-        from translator import _post_process_title
+        from text_utils import post_process_title
 
-        result = _post_process_title("")
+        result = post_process_title("")
         assert result == ""
 
     def test_handles_only_special_chars(self):
         """只有特殊符号的标题返回空字符串"""
-        from translator import _post_process_title
+        from text_utils import post_process_title
 
-        result = _post_process_title("!!!@@@###")
+        result = post_process_title("!!!@@@###")
         assert result == ""
 
     def test_preserves_cyrillic(self):
         """保留俄语西里尔字母"""
-        from translator import _post_process_title
+        from text_utils import post_process_title
 
-        result = _post_process_title("Бутылка для Масла")
+        result = post_process_title("Бутылка для Масла")
         # 所有西里尔字母应被保留（转为小写）
         assert "бутылка" in result
         assert "для" in result

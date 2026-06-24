@@ -354,3 +354,309 @@ class TestGenerateTranslationDownload:
         assert rows[0][4] == "массажер для лица"
         assert rows[1][0] == "B0F45N6NS7"
         assert rows[1][5] == "антицеллюлитный массажер"
+
+
+# ============================================================
+# 两阶段工作流测试：execute_phase1_extraction
+# ============================================================
+
+SAMPLE_HTML_CONTENT = "<html><body><h1>5-in-1 Face Sculpting Machine</h1><p>Beauty device</p></body></html>"
+
+
+def _setup_test_html_dir(tmp_path, asin_html_map: dict[str, str]) -> str:
+    """创建测试用 HTML 目录，返回路径。"""
+    html_dir = tmp_path / "html"
+    html_dir.mkdir()
+    for asin, content in asin_html_map.items():
+        (html_dir / f"{asin}.html").write_text(content, encoding="utf-8")
+    return str(html_dir)
+
+
+def _setup_test_db(tmp_path) -> str:
+    """创建测试用 SQLite 数据库，返回路径。"""
+    import sqlite3
+    from db import init_db
+
+    db_path = str(tmp_path / "test_products.db")
+    db = sqlite3.connect(db_path)
+    init_db(db)
+    db.close()
+    return db_path
+
+
+class TestExecutePhase1Extraction:
+    """Phase 1 信息萃取编排行为。"""
+
+    def test_extracts_html_and_saves_to_db(self, tmp_path):
+        """正常流程：读取 HTML → AI 萃取 → 写入 products 表"""
+        from translator_ui import execute_phase1_extraction
+
+        html_dir = _setup_test_html_dir(tmp_path, {
+            "B0TEST001": SAMPLE_HTML_CONTENT,
+            "B0TEST002": SAMPLE_HTML_CONTENT,
+        })
+        db_path = _setup_test_db(tmp_path)
+
+        results = execute_phase1_extraction(
+            asins=["B0TEST001", "B0TEST002"],
+            html_dir=html_dir,
+            db_path=db_path,
+            _extractor_override="mock",
+        )
+
+        assert len(results) == 2
+        assert all("error" not in r for r in results)
+        assert results[0]["asin"] == "B0TEST001"
+
+        # 验证数据库中有记录
+        import sqlite3
+        from db import get_product
+
+        db = sqlite3.connect(db_path)
+        product = get_product(db, "B0TEST001")
+        db.close()
+        assert product is not None
+        assert product["asin"] == "B0TEST001"
+        assert product["category"] == "Beauty & Personal Care"
+        assert "Facial massage" in product["features"]
+
+    def test_skips_missing_html_files(self, tmp_path):
+        """HTML 文件不存在时返回 error，不崩溃"""
+        from translator_ui import execute_phase1_extraction
+
+        html_dir = _setup_test_html_dir(tmp_path, {
+            "B0TEST001": SAMPLE_HTML_CONTENT,
+        })
+        db_path = _setup_test_db(tmp_path)
+
+        results = execute_phase1_extraction(
+            asins=["B0TEST001", "B0MISSING"],
+            html_dir=html_dir,
+            db_path=db_path,
+            _extractor_override="mock",
+        )
+
+        assert len(results) == 2
+        # 第一个成功
+        assert "error" not in results[0]
+        # 第二个失败（HTML 不存在）
+        assert "error" in results[1]
+        assert "HTML" in results[1]["error"]
+
+    def test_progress_callback_fires_after_each_asin(self, tmp_path):
+        """每处理一个 ASIN 触发 progress_callback(current, total)"""
+        from translator_ui import execute_phase1_extraction
+
+        html_dir = _setup_test_html_dir(tmp_path, {
+            "B0TEST001": SAMPLE_HTML_CONTENT,
+            "B0TEST002": SAMPLE_HTML_CONTENT,
+        })
+        db_path = _setup_test_db(tmp_path)
+
+        progress = []
+        results = execute_phase1_extraction(
+            asins=["B0TEST001", "B0TEST002"],
+            html_dir=html_dir,
+            db_path=db_path,
+            _extractor_override="mock",
+            progress_callback=lambda i, total: progress.append((i, total)),
+        )
+
+        assert len(progress) == 2
+        assert progress[0] == (1, 2)
+        assert progress[1] == (2, 2)
+
+    def test_handles_empty_asin_list(self, tmp_path):
+        """空 ASIN 列表返回空结果，不崩溃"""
+        from translator_ui import execute_phase1_extraction
+
+        html_dir = _setup_test_html_dir(tmp_path, {})
+        db_path = _setup_test_db(tmp_path)
+
+        results = execute_phase1_extraction(
+            asins=[],
+            html_dir=html_dir,
+            db_path=db_path,
+            _extractor_override="mock",
+        )
+
+        assert results == []
+
+
+# ============================================================
+# 两阶段工作流测试：execute_phase2_generation
+# ============================================================
+
+def _seed_products_table(db_path: str, products: list[dict]) -> None:
+    """向 products 表插入测试数据。"""
+    import sqlite3
+    from db import upsert_product
+
+    db = sqlite3.connect(db_path)
+    for p in products:
+        upsert_product(db, p)
+    db.close()
+
+
+class TestExecutePhase2Generation:
+    """Phase 2 文案生成编排行为。"""
+
+    def test_generates_from_db_and_saves_translations(self, tmp_path):
+        """正常流程：从 products 读取 → AI 生成 → 写入 translations 表"""
+        from translator_ui import execute_phase2_generation
+
+        db_path = _setup_test_db(tmp_path)
+        _seed_products_table(db_path, [
+            {"asin": "B0TEST001", "title": "Test Product", "category": "Beauty"},
+            {"asin": "B0TEST002", "title": "Test Product 2", "category": "Kitchen"},
+        ])
+
+        results = execute_phase2_generation(
+            asins=["B0TEST001", "B0TEST002"],
+            db_path=db_path,
+            _generator_override="mock",
+        )
+
+        assert len(results) == 2
+        assert all("error" not in r for r in results)
+
+        # 验证数据库中有翻译记录
+        import sqlite3
+        from db import get_translation
+
+        db = sqlite3.connect(db_path)
+        t1 = get_translation(db, "B0TEST001")
+        db.close()
+        assert t1 is not None
+        assert t1["russian_title"]
+        assert t1["core_keywords"]
+        assert t1["russian_description"]
+
+    def test_skips_products_not_in_db(self, tmp_path):
+        """数据库中不存在的 ASIN 返回 error"""
+        from translator_ui import execute_phase2_generation
+
+        db_path = _setup_test_db(tmp_path)
+        _seed_products_table(db_path, [
+            {"asin": "B0TEST001", "title": "Test Product", "category": "Beauty"},
+        ])
+
+        results = execute_phase2_generation(
+            asins=["B0TEST001", "B0MISSING"],
+            db_path=db_path,
+            _generator_override="mock",
+        )
+
+        assert len(results) == 2
+        assert "error" not in results[0]
+        assert "error" in results[1]
+        assert "不存在" in results[1]["error"]
+
+    def test_progress_callback_fires_after_each_asin(self, tmp_path):
+        """每处理一个 ASIN 触发 progress_callback(current, total)"""
+        from translator_ui import execute_phase2_generation
+
+        db_path = _setup_test_db(tmp_path)
+        _seed_products_table(db_path, [
+            {"asin": "B0TEST001", "title": "Test Product", "category": "Beauty"},
+        ])
+
+        progress = []
+        execute_phase2_generation(
+            asins=["B0TEST001"],
+            db_path=db_path,
+            _generator_override="mock",
+            progress_callback=lambda i, total: progress.append((i, total)),
+        )
+
+        assert progress == [(1, 1)]
+
+    def test_handles_empty_asin_list(self, tmp_path):
+        """空 ASIN 列表返回空结果"""
+        from translator_ui import execute_phase2_generation
+
+        db_path = _setup_test_db(tmp_path)
+        results = execute_phase2_generation(
+            asins=[],
+            db_path=db_path,
+            _generator_override="mock",
+        )
+
+        assert results == []
+
+
+# ============================================================
+# 两阶段工作流测试：generate_phase2_download
+# ============================================================
+
+class TestGeneratePhase2Download:
+    """Phase 2 下载文件生成行为。"""
+
+    def test_returns_12_column_xlsx_from_db(self, tmp_path):
+        """从数据库读取 translations + products 生成 12 列 xlsx"""
+        from translator_ui import generate_phase2_download
+
+        db_path = _setup_test_db(tmp_path)
+        _seed_products_table(db_path, [
+            {
+                "asin": "B0TEST001",
+                "title": "Test Product",
+                "details": "Test details",
+                "image_urls": "https://img1.jpg",
+            },
+        ])
+
+        # 同时插入翻译记录
+        import sqlite3
+        from db import upsert_translation
+
+        db = sqlite3.connect(db_path)
+        upsert_translation(db, {
+            "asin": "B0TEST001",
+            "russian_title": "тестовый продукт",
+            "core_keywords": "тест ключевые слова",
+            "russian_description": "Описание тестового продукта.",
+            "phase1_model": "mock",
+            "phase2_model": "mock",
+        })
+        db.close()
+
+        data = generate_phase2_download(db_path=db_path, asins=["B0TEST001"])
+
+        assert isinstance(data, bytes)
+        assert len(data) > 0
+
+        import openpyxl
+        import io
+
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        wb.close()
+
+        assert len(headers) == 12
+        assert headers[0] == "asin"
+        assert headers[4] == "核心流量词"
+        assert headers[5] == "俄语标题"
+
+    def test_handles_empty_asins(self, tmp_path):
+        """空 ASIN 列表返回空 xlsx（仅有表头）"""
+        from translator_ui import generate_phase2_download
+
+        db_path = _setup_test_db(tmp_path)
+        data = generate_phase2_download(db_path=db_path, asins=[])
+
+        assert isinstance(data, bytes)
+        assert len(data) > 0
+
+        import openpyxl
+        import io
+
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True)
+        ws = wb.active
+        headers = [cell.value for cell in ws[1]]
+        rows = list(ws.iter_rows(min_row=2, values_only=True))
+        wb.close()
+
+        assert len(headers) == 12
+        assert len(rows) == 0  # 无数据行

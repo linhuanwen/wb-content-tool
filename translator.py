@@ -17,6 +17,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from pathlib import Path
 
+from text_utils import MARKDOWN_JSON_RE, parse_json_response, post_process_title
+
 
 # ============================================================
 # System Prompt 加载
@@ -46,49 +48,8 @@ def _load_system_prompt() -> str:
     return path.read_text(encoding="utf-8")
 
 
-# 标题最大字符数
-_MAX_TITLE_LENGTH = 60
-
-# 标题中允许保留的字符模式：西里尔字母、拉丁字母、数字、空格
-_TITLE_ALLOWED_CHARS = re.compile(r"[^a-zA-Zа-яА-ЯёЁ0-9\s]")
-
-
-def _post_process_title(title: str) -> str:
-    """对 AI 生成的俄语标题进行后处理。
-
-    规则：
-    1. 全小写
-    2. 去除特殊符号（保留字母、数字、空格）
-    3. 截断到 60 字符以内
-    4. 去除首尾空格
-
-    Args:
-        title: AI 生成的原始俄语标题。
-
-    Returns:
-        处理后的标题字符串。
-    """
-    if not title:
-        return ""
-
-    # 去特殊符号 → 小写 → 去首尾空格
-    cleaned = _TITLE_ALLOWED_CHARS.sub("", title)
-    lowered = cleaned.lower()
-    stripped = lowered.strip()
-
-    # 截断到 60 字符
-    if len(stripped) > _MAX_TITLE_LENGTH:
-        stripped = stripped[:_MAX_TITLE_LENGTH]
-
-    # 截断后再次去除可能的首尾空格
-    return stripped.strip()
-
-
 # AI 响应 JSON 中必须包含的字段
 _REQUIRED_JSON_FIELDS = {"russian_title", "core_keywords", "russian_description"}
-
-# Markdown 代码块 JSON 提取正则
-_MARKDOWN_JSON_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
 
 
 def _parse_ai_response(text: str) -> dict:
@@ -107,43 +68,7 @@ def _parse_ai_response(text: str) -> dict:
     Raises:
         ValueError: 无法解析 JSON、或缺少必要字段时抛出。
     """
-    if not text or not text.strip():
-        raise ValueError("AI 返回空响应，无法解析 JSON")
-
-    parsed: dict | None = None
-
-    # 尝试 1：直接解析
-    try:
-        parsed = json.loads(text.strip())
-    except json.JSONDecodeError:
-        pass
-
-    # 尝试 2：从 Markdown 代码块提取
-    if parsed is None:
-        match = _MARKDOWN_JSON_RE.search(text)
-        if match:
-            try:
-                parsed = json.loads(match.group(1).strip())
-            except json.JSONDecodeError:
-                pass
-
-    if parsed is None:
-        raise ValueError(
-            f"无法解析 AI 响应为 JSON。"
-            f"响应前 200 字符: {text.strip()[:200]}"
-        )
-
-    if not isinstance(parsed, dict):
-        raise ValueError(f"AI 返回的 JSON 不是对象类型: {type(parsed).__name__}")
-
-    # 验证必要字段
-    missing = _REQUIRED_JSON_FIELDS - set(parsed.keys())
-    if missing:
-        raise ValueError(
-            f"AI 返回的 JSON 缺少必要字段: {', '.join(sorted(missing))}"
-        )
-
-    return parsed
+    return parse_json_response(text, required_fields=_REQUIRED_JSON_FIELDS)
 
 
 # ============================================================
@@ -189,16 +114,20 @@ class TranslationProvider(ABC):
             raw = self._call_api(title, details)
             parsed = _parse_ai_response(raw)
 
-        parsed["russian_title"] = _post_process_title(parsed["russian_title"])
+        parsed["russian_title"] = post_process_title(parsed["russian_title"])
         return parsed
 
 
 def _build_user_message(title: str, details: str) -> str:
     """构建发送给 AI 的用户消息。"""
     return (
-        f"请将以下英文产品文案翻译并优化为俄语 SEO 文案：\n\n"
-        f"标题：{title}\n\n"
-        f"详情：{details}"
+        f"请将以下英文产品文案优化为 Wildberries 俄语 SEO 文案。\n\n"
+        f"禁止直译——必须按照 System Prompt 中定义的蜘蛛网关键词三层布局策略，"
+        f"重新组织语言结构。\n\n"
+        f"=== 英文标题 ===\n{title}\n\n"
+        f"=== 英文详情 ===\n{details}\n\n"
+        f"最终提醒：标题 ≤60字符、全小写、无特殊符号、无品牌词。"
+        f"详情中核心关键词需以同义词形式自然重复出现 2-3 次。"
     )
 
 
@@ -233,7 +162,7 @@ class OpenAICompatibleProvider(TranslationProvider):
                 {"role": "system", "content": _load_system_prompt()},
                 {"role": "user", "content": _build_user_message(title, details)},
             ],
-            temperature=0.7,
+            temperature=0.3,
         )
 
         return response.choices[0].message.content or ""
@@ -255,6 +184,7 @@ class ClaudeProvider(TranslationProvider):
         response = client.messages.create(
             model=self.model,
             max_tokens=2048,
+            temperature=0.3,
             system=_load_system_prompt(),
             messages=[
                 {"role": "user", "content": _build_user_message(title, details)},

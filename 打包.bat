@@ -21,22 +21,35 @@ mkdir "%DIST_DIR%"
 echo [2/4] 复制项目文件...
 
 :: 核心 Python 模块
-copy "%~dp0app.py"           "%DIST_DIR%\" >nul
-copy "%~dp0config.py"        "%DIST_DIR%\" >nul
-copy "%~dp0crawler.py"       "%DIST_DIR%\" >nul
-copy "%~dp0crawler_ui.py"    "%DIST_DIR%\" >nul
-copy "%~dp0excel_io.py"      "%DIST_DIR%\" >nul
-copy "%~dp0extractor.py"     "%DIST_DIR%\" >nul
-copy "%~dp0translator.py"    "%DIST_DIR%\" >nul
-copy "%~dp0translator_ui.py" "%DIST_DIR%\" >nul
+copy "%~dp0app.py"                 "%DIST_DIR%\" >nul
+copy "%~dp0config.py"              "%DIST_DIR%\" >nul
+copy "%~dp0crawler.py"             "%DIST_DIR%\" >nul
+copy "%~dp0crawler_ui.py"          "%DIST_DIR%\" >nul
+copy "%~dp0phase1_extractor.py"    "%DIST_DIR%\" >nul
+copy "%~dp0phase2_translator.py"   "%DIST_DIR%\" >nul
+copy "%~dp0translator.py"          "%DIST_DIR%\" >nul
+copy "%~dp0translator_ui.py"       "%DIST_DIR%\" >nul
+copy "%~dp0image_processor.py"     "%DIST_DIR%\" >nul
+copy "%~dp0image_translator.py"    "%DIST_DIR%\" >nul
+copy "%~dp0image_translator_ui.py" "%DIST_DIR%\" >nul
+copy "%~dp0image_generator.py"     "%DIST_DIR%\" >nul
+copy "%~dp0image_generator_ui.py"  "%DIST_DIR%\" >nul
+copy "%~dp0worker.py"              "%DIST_DIR%\" >nul
+copy "%~dp0db.py"                  "%DIST_DIR%\" >nul
+copy "%~dp0excel_io.py"            "%DIST_DIR%\" >nul
+copy "%~dp0r2_storage.py"          "%DIST_DIR%\" >nul
+copy "%~dp0text_utils.py"          "%DIST_DIR%\" >nul
 
 :: 配置文件
 copy "%~dp0requirements.txt"  "%DIST_DIR%\" >nul
-copy "%~dp0.env.template"     "%DIST_DIR%\" >nul
 
-:: Prompt
+:: Prompts（所有 AI 提示词模板）
 mkdir "%DIST_DIR%\prompts" 2>nul
-copy "%~dp0prompts\translation_persona.txt" "%DIST_DIR%\prompts\" >nul
+copy "%~dp0prompts\translation_persona.txt"        "%DIST_DIR%\prompts\" >nul
+copy "%~dp0prompts\image_translation_persona.txt"  "%DIST_DIR%\prompts\" >nul
+copy "%~dp0prompts\phase1_extraction_persona.txt"  "%DIST_DIR%\prompts\" >nul
+copy "%~dp0prompts\phase2_translation_persona.txt" "%DIST_DIR%\prompts\" >nul
+copy "%~dp0prompts\gemini_card_design_persona.txt" "%DIST_DIR%\prompts\" >nul
 
 :: Streamlit 配置
 mkdir "%DIST_DIR%\.streamlit" 2>nul
@@ -97,18 +110,12 @@ echo     pause
 echo     exit /b 1
 echo ^)
 echo.
-echo [1/3] 创建虚拟环境...
+echo [1/2] 创建虚拟环境...
 echo python -m venv venv
 echo.
-echo [2/3] 安装 Python 依赖...
+echo [2/2] 安装 Python 依赖...
 echo call venv\Scripts\activate.bat
 echo pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-echo.
-echo [3/3] 初始化配置文件...
-echo if not exist ".env" ^(
-echo     copy .env.template .env ^>nul
-echo     echo [提示] 已从模板创建 .env 文件，请编辑填入你的 API Key
-echo ^)
 echo.
 echo echo.
 echo echo ========================================
@@ -116,8 +123,8 @@ echo echo   安装完成！
 echo echo ========================================
 echo echo.
 echo echo 下一步：
-echo echo   1. 编辑 .env 文件，填入你的 API Key
-echo echo   2. 双击 启动.bat 即可运行
+echo echo   1. 双击 启动.bat 运行（首次启动自动创建 .env 文件）
+echo echo   2. 在 Web 界面侧边栏配置 API Key 后点击"保存配置"
 echo echo.
 echo pause
 ) > "%DIST_DIR%\安装.bat"

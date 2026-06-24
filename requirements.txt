@@ -45,11 +45,14 @@ boto3>=1.35
 # AI 图片修复
 replicate>=1.0
 
+# Gemini image generation
+google-genai>=1.0
+
 # ==== 可选依赖 ====
 # Playwright 模式（不使用 ScraperAPI 时需要）
 # 安装后需运行: playwright install chromium
-# playwright>=1.40
+playwright>=1.40
 
 # 测试（开发用）
-# pytest>=8.0
-# pytest-asyncio>=0.24
+pytest>=8.0
+pytest-asyncio>=0.24

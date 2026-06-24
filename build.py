@@ -13,23 +13,42 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 DIST_DIR = os.path.join(ROOT, "dist", "WB-Content-Tool")
 ZIP_FILE = os.path.join(ROOT, "dist", "WB-Content-Tool.zip")
 
-# 要包含的 Python 模块
+# 要包含的 Python 模块（核心运行时代码）
 PY_MODULES = [
+    # 主入口 & 配置
     "app.py",
     "config.py",
+    # 采集
     "crawler.py",
     "crawler_ui.py",
-    "excel_io.py",
-    "extractor.py",
+    # Phase 1: AI 信息萃取
+    "phase1_extractor.py",
+    # Phase 2: AI 文案翻译
+    "phase2_translator.py",
+    # 翻译
     "translator.py",
     "translator_ui.py",
+    # 图片处理 & 翻译
+    "image_processor.py",
+    "image_translator.py",
+    "image_translator_ui.py",
+    # 图片生成（Gemini）
+    "image_generator.py",
+    "image_generator_ui.py",
+    # 工作线程 & 数据库
+    "worker.py",
+    "db.py",
+    # 工具模块
+    "excel_io.py",
+    "r2_storage.py",
+    "text_utils.py",
 ]
 
 # 要包含的配置/数据文件
 DATA_FILES = [
     "requirements.txt",
-    ".env.template",
     "README.md",
+    "CONTEXT.md",
 ]
 
 # 要包含的目录
@@ -108,18 +127,12 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo [1/3] 创建虚拟环境...
+echo [1/2] 创建虚拟环境...
 python -m venv venv
 
-echo [2/3] 安装 Python 依赖（使用清华镜像加速）...
+echo [2/2] 安装 Python 依赖（使用清华镜像加速）...
 call venv\Scripts\activate.bat
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-
-echo [3/3] 初始化配置文件...
-if not exist ".env" (
-    copy .env.template .env >nul
-    echo   [提示] 已从模板创建 .env 文件
-)
 
 echo.
 echo ========================================
@@ -127,9 +140,8 @@ echo   安装完成！
 echo ========================================
 echo.
 echo 下一步：
-echo   1. 编辑 .env 文件，填入你的 API Key
-echo      需要填写的：TRANSLATE_API_KEY、SCRAPERAPI_KEY
-echo   2. 双击 启动.bat 即可运行
+echo   1. 双击 启动.bat 运行（首次启动自动创建 .env 文件）
+echo   2. 在 Web 界面侧边栏配置 API Key 后点击"保存配置"
 echo.
 pause
 '''
@@ -204,8 +216,8 @@ def main():
     print("  使用方法（在目标电脑上）：")
     print("    1. 解压 ZIP")
     print("    2. 双击 安装.bat")
-    print("    3. 编辑 .env 填入 API Key")
-    print("    4. 双击 启动.bat")
+    print("    3. 双击 启动.bat")
+    print("    4. 在 Web 界面侧边栏配置 API Key → 保存")
     print("=" * 48)
 
 

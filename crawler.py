@@ -9,14 +9,15 @@
 import argparse
 import asyncio
 import logging
+import os
 import random
+from pathlib import Path
 from typing import Callable
 
 import httpx
 
 from config import settings
 from excel_io import read_asins_from_excel, write_products_to_excel
-from extractor import extract_product_info
 
 logger = logging.getLogger(__name__)
 
@@ -190,10 +191,13 @@ async def crawl_asins(
     max_retries: int = 2,
     stop_on_first_error: bool = True,
 ) -> list[dict]:
-    """批量爬取亚马逊产品信息。
+    """批量爬取亚马逊产品页 HTML 并存档。
 
-    对每个 ASIN 依次执行：获取页面 → 检测验证码 → 提取信息。
+    对每个 ASIN 依次执行：获取页面 → 检测验证码 → 存档 HTML。
     失败时自动重试（最多 max_retries 次），验证码不重试。
+
+    HTML 存档到 html/{ASIN}.html，供 Phase 1 AI 萃取使用。
+    标题/图片url/详情由 Phase 1 从 HTML 中提取并写入数据库，爬虫不再负责提取。
 
     Args:
         asins: ASIN 列表。
@@ -207,6 +211,7 @@ async def crawl_asins(
 
     Returns:
         产品信息字典列表，每个字典包含 asin, 标题, 图片url, 详情。
+        标题/图片url/详情当前返回空字符串（由 Phase 1 填充）。
         当 stop_on_first_error=False 时，失败的 ASIN 不在返回列表中。
 
     Raises:
@@ -229,7 +234,22 @@ async def crawl_asins(
                         f"请手动在浏览器中完成验证后重试，或等待一段时间后再爬取。"
                     )
 
-                info = extract_product_info(html, asin)
+                # 存档 HTML 到 html/{ASIN}.html
+                html_dir = Path("html")
+                html_dir.mkdir(parents=True, exist_ok=True)
+                html_path = html_dir / f"{asin}.html"
+                html_path.write_text(html, encoding="utf-8")
+
+                # 从 HTML 中确定性提取标题/图片url/详情
+                # （Phase 1 AI 萃取负责更丰富的 15 个语义字段）
+                from phase1_extractor import _extract_basic_fields
+                basic = _extract_basic_fields(html)
+                info = {
+                    "asin": asin,
+                    "标题": basic["title"],
+                    "图片url": basic["image_urls"],
+                    "详情": basic["details"],
+                }
                 products.append(info)
 
                 if progress_callback:

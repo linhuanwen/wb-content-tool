@@ -13,7 +13,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -32,7 +34,7 @@ async def _real_download(url: str) -> str:
     """真实图片下载：HTTP GET → 临时文件。"""
     import tempfile
 
-    import requests
+    import httpx
 
     headers = {
         "User-Agent": (
@@ -40,8 +42,9 @@ async def _real_download(url: str) -> str:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         )
     }
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
 
     suffix = ".jpg"
     if "png" in url.lower():
@@ -113,61 +116,99 @@ async def _real_ocr(local_path: str) -> list[TextRegion]:
         # EasyOCR 未安装，返回空（后续步骤将 skip 翻译）
         return []
     except Exception:
-        # OCR 异常也返回空列表，走"无文字"路径（resize+upload 不翻译）
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.warning("OCR 失败，跳过文字检测", exc_info=True)
         return []
 
 
-async def _real_translate(texts: list[str]) -> list[str]:
-    """真实翻译：调用 DeepSeek API 将英文→俄文。"""
+async def _real_translate(texts: list[str], product_context: dict[str, str] | None = None) -> list[str]:
+    """真实翻译：调用 AI API 将英文→俄文，结合产品上下文做上下文感知翻译。
+
+    Args:
+        texts: OCR 检测到的英文文本列表。
+        product_context: 产品数据信息库，可包含 标题、详情、俄语标题、核心流量词、俄语详情。
+            当来自翻译后 12 列 Excel 时，所有字段均存在；
+            当来自爬虫 4 列 Excel 时，仅含 标题 和 详情。
+    """
     import json
 
-    import requests
+    import httpx
 
     from config import settings
 
     if not texts:
         return []
 
-    prompt = (
-        "Translate the following English product label texts to Russian.\n"
-        "Rules:\n"
-        "1. Accurate direct translation, no adding or removing information\n"
-        "2. Keep technical parameters, numbers, and units exact\n"
-        "3. Output ONLY a JSON array of strings, no other text\n"
-        "4. All lowercase, no special symbols\n\n"
-        "Texts to translate:\n"
+    # ── 加载图片翻译人设 System Prompt ──
+    persona_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "prompts", "image_translation_persona.txt"
     )
+    system_prompt = ""
+    if os.path.isfile(persona_path):
+        with open(persona_path, "r", encoding="utf-8") as f:
+            system_prompt = f.read()
+
+    # ── 构建 User Prompt ──
+    prompt_parts: list[str] = []
+
+    # 第 1 部分：产品数据信息库（如有）
+    if product_context and any(product_context.values()):
+        prompt_parts.append("=== 产品数据信息库（请结合此上下文进行翻译决策）===")
+        if product_context.get("俄语标题"):
+            prompt_parts.append(f"【俄语标题】{product_context['俄语标题']}")
+        if product_context.get("核心流量词"):
+            prompt_parts.append(f"【核心流量词】{product_context['核心流量词']}")
+        if product_context.get("俄语详情"):
+            prompt_parts.append(f"【俄语详情】{product_context['俄语详情']}")
+        if product_context.get("标题"):
+            prompt_parts.append(f"【英文原标题】{product_context['标题']}")
+        if product_context.get("详情"):
+            prompt_parts.append(f"【英文原详情】{product_context['详情']}")
+        prompt_parts.append("")
+
+    # 第 2 部分：翻译任务
+    prompt_parts.append("=== 图片上待翻译的英文文字 ===")
     for i, t in enumerate(texts, 1):
-        prompt += f"{i}. {t}\n"
-    prompt += '\nOutput: {"translations": ["translation1", "translation2", ...]}'
+        prompt_parts.append(f"{i}. {t}")
+
+    prompt_parts.append("")
+    prompt_parts.append('请结合产品数据信息库，对以上图片文字做出上下文感知翻译。')
+    prompt_parts.append('输出格式：{"translations": ["译文1", "译文2", ...]}')
+    prompt_parts.append("translations 数组长度必须等于上文待翻译文字的数量，顺序一一对应。")
+
+    prompt = "\n".join(prompt_parts)
+
+    # 使用 Phase 1 配置（图片翻译属于 Phase 1 阶段）
+    api_key = settings.phase1_api_key or settings.translate_api_key
+    api_url = (settings.phase1_api_base_url or settings.translate_api_base_url).rstrip("/") + "/v1/chat/completions"
+    model = settings.phase1_model or settings.translate_model
 
     headers = {
-        "Authorization": f"Bearer {settings.translate_api_key}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": settings.translate_model,
+        "model": model,
         "messages": [
             {
                 "role": "system",
-                "content": "You are a professional English-to-Russian translator for e-commerce product labels. Output only valid JSON.",
+                "content": system_prompt or "You are a professional English-to-Russian translator for e-commerce product labels. Output only valid JSON.",
             },
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,
-        "max_tokens": 4096,  # 推理模型（deepseek-v4-pro）需预留 reasoning token
+        "max_tokens": 4096,
     }
 
-    api_url = settings.translate_api_base_url.rstrip("/") + "/v1/chat/completions"
-    resp = requests.post(api_url, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(api_url, json=payload, headers=headers)
+        resp.raise_for_status()
 
     data = resp.json()
     content = data["choices"][0]["message"]["content"]
 
     # 提取 JSON
-    import re
-
     m = re.search(r'\{[^}]+\}', content)
     if m:
         result = json.loads(m.group())
@@ -279,12 +320,14 @@ class AsinImageResult:
         success_count: status="ok" 的图片数。
         error_count: status="error" 的图片数。
         skipped_count: status="skipped" 的图片数。
+        video_count: status="video" 的条目数。
     """
     asin: str = ""
     images: list[ImageResult] = field(default_factory=list)
     success_count: int = 0
     error_count: int = 0
     skipped_count: int = 0
+    video_count: int = 0
 
 
 @dataclass
@@ -299,6 +342,7 @@ class BatchImageResult:
         success_images: 成功图片数。
         error_images: 失败图片数。
         skipped_images: 跳过图片数。
+        video_images: 视频链接数。
         started_at: 开始时间 ISO 字符串。
         finished_at: 结束时间 ISO 字符串。
     """
@@ -309,6 +353,7 @@ class BatchImageResult:
     success_images: int = 0
     error_images: int = 0
     skipped_images: int = 0
+    video_images: int = 0
     started_at: str = ""
     finished_at: str = ""
 
@@ -319,6 +364,7 @@ async def translate_single_image(
     index: int,
     font_config: FontConfig,
     *,
+    product_context: dict[str, str] | None = None,
     _download_func: Callable | None = None,
     _ocr_func: Callable | None = None,
     _translate_func: Callable | None = None,
@@ -337,6 +383,8 @@ async def translate_single_image(
         asin: 产品 ASIN。
         index: 图片序号（0-based）。
         font_config: 字体配置。
+        product_context: 产品数据信息库（可含 标题/详情/俄语标题/核心流量词/俄语详情）。
+            AI 翻译时会结合此上下文做出上下文感知翻译。
         _download_func: 下载函数（测试注入）。
         _ocr_func: OCR 函数（测试注入）。
         _translate_func: 翻译函数（测试注入）。
@@ -435,7 +483,8 @@ async def translate_single_image(
 
     # ── 步骤3: 翻译 ──
     try:
-        raw = _translate([r.text for r in regions])
+        # 传递 product_context 给翻译函数，实现上下文感知翻译
+        raw = _translate([r.text for r in regions], product_context) if product_context else _translate([r.text for r in regions])
         translations = await raw if asyncio.iscoroutine(raw) else raw
         result.translated_texts = translations
         for r, t in zip(regions, translations):
@@ -474,7 +523,7 @@ async def translate_single_image(
         if _repair_func:
             repaired = _repair_func(img, regions)
             img = await repaired if asyncio.iscoroutine(repaired) else repaired
-    except Exception:
+    except Exception as e:
         # 修复失败 → skip 擦除+覆写，继续 resize+upload
         try:
             if _resize_func:
@@ -491,7 +540,7 @@ async def translate_single_image(
             r2 = _upload(out_path, remote_key)
             result.r2_url = await r2 if asyncio.iscoroutine(r2) else r2
             result.status = "error"
-            result.error = f"AI 修复失败{': ' + str(e) if 'e' in dir() else ''}"
+            result.error = f"AI 修复失败: {e}"
         except Exception as e2:
             result.status = "error"
             result.error = f"修复失败 + 后续处理失败: {e2}"
@@ -544,6 +593,7 @@ async def translate_asin_images(
 
     Args:
         product: 产品字典，需包含 asin 和 图片url（以 " | " 分隔的多 URL）。
+            可选 product_context 字段（产品数据信息库）。
         font_config: 字体配置。
         _*_func: 测试注入用。
 
@@ -552,22 +602,37 @@ async def translate_asin_images(
     """
     asin = product.get("asin", "")
     image_urls_str = product.get("图片url", "")
+    product_context = product.get("product_context", None)
     # 爬虫输出用 ; 分隔，也兼容 | 分隔
     import re as _re
-    urls = [u.strip() for u in _re.split(r'[;|]', image_urls_str) if u.strip()]
+    all_urls = [u.strip() for u in _re.split(r'[;|]', image_urls_str) if u.strip()]
 
-    if not urls:
+    if not all_urls:
         return AsinImageResult(asin=asin)
 
-    # 并发处理所有图片
+    # 分离视频 URL 和图片 URL
+    # 视频 URL 不参与图片翻译管线，通过 URL 模式识别（vse-vms-transcoding / .m3u8 等）
+    from phase1_extractor import _is_video_url
+
+    video_urls: list[tuple[int, str]] = []  # (原始序号, 视频URL)
+    image_urls: list[tuple[int, str]] = []  # (原始序号, 图片URL)
+
+    for i, url in enumerate(all_urls):
+        if _is_video_url(url):
+            video_urls.append((i, url))
+        else:
+            image_urls.append((i, url))
+
+    # 并发处理图片 URL
     tasks = []
-    for i, url in enumerate(urls):
+    for orig_idx, url in image_urls:
         tasks.append(
             translate_single_image(
                 image_url=url,
                 asin=asin,
-                index=i,
+                index=orig_idx,
                 font_config=font_config,
+                product_context=product_context,
                 _download_func=_download_func,
                 _ocr_func=_ocr_func,
                 _translate_func=_translate_func,
@@ -577,18 +642,37 @@ async def translate_asin_images(
             )
         )
 
-    image_results = await asyncio.gather(*tasks)
+    image_results = await asyncio.gather(*tasks) if tasks else []
 
-    success = sum(1 for r in image_results if r.status == "ok")
-    errors = sum(1 for r in image_results if r.status == "error")
-    skipped = sum(1 for r in image_results if r.status == "skipped")
+    # 为视频 URL 创建占位结果（保留原链接，不处理）
+    video_results: list[ImageResult] = []
+    for orig_idx, video_url in video_urls:
+        video_results.append(ImageResult(
+            index=orig_idx,
+            original_url=video_url,
+            r2_url=video_url,  # 视频链接保持不变
+            local_path="",
+            has_text=False,
+            translated=False,
+            status="video",
+        ))
+
+    # 按原始序号合并并排序
+    all_results = image_results + video_results
+    all_results.sort(key=lambda r: r.index)
+
+    success = sum(1 for r in all_results if r.status == "ok")
+    errors = sum(1 for r in all_results if r.status == "error")
+    skipped = sum(1 for r in all_results if r.status == "skipped")
+    videos = sum(1 for r in all_results if r.status == "video")
 
     return AsinImageResult(
         asin=asin,
-        images=list(image_results),
+        images=list(all_results),
         success_count=success,
         error_count=errors,
         skipped_count=skipped,
+        video_count=videos,
     )
 
 
@@ -642,6 +726,7 @@ async def translate_batch(
     success_images = 0
     error_images = 0
     skipped_images = 0
+    video_images = 0
 
     for product in products:
         asin = product.get("asin", "")
@@ -665,6 +750,7 @@ async def translate_batch(
         success_images += asin_result.success_count
         error_images += asin_result.error_count
         skipped_images += asin_result.skipped_count
+        video_images += asin_result.video_count
 
         # 写入 progress.json
         if resume_from:
@@ -695,6 +781,7 @@ async def translate_batch(
         success_images=success_images,
         error_images=error_images,
         skipped_images=skipped_images,
+        video_images=video_images,
         started_at=started_at,
         finished_at=finished_at,
     )

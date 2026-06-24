@@ -293,3 +293,332 @@ class WorkerManager:
             )
         )
         return self._result
+
+    def run_card_generation_sync(
+        self,
+        products: list[dict],
+        *,
+        mode: str = "card_design",
+        custom_prompt: str = "",
+        _download_func=None,
+        _generate_func=None,
+        _resize_func=None,
+        _upload_func=None,
+    ):
+        """同步运行批量卡片生成（阻塞当前线程直到完成）。
+
+        用于 Streamlit UI 等需要等待结果的场景。
+        与 run_sync 平行，但委托给 Gemini 卡片生成管线。
+
+        Returns:
+            BatchCardResult。
+        """
+        import asyncio as _asyncio
+
+        from datetime import datetime as _dt
+        from image_generator import generate_batch_cards
+
+        CARD_PROGRESS_FILE = "card_progress.json"
+
+        # 新运行前清除旧的 card_progress.json
+        if os.path.isfile(CARD_PROGRESS_FILE):
+            os.remove(CARD_PROGRESS_FILE)
+
+        with self._lock:
+            self._state = "running"
+            self._total_asins = len(products)
+            self._completed_asins = 0
+            self._started_at = _dt.now().isoformat()
+            self._error = ""
+            self._result = None
+
+        async def _run_cards():
+            return await generate_batch_cards(
+                products=products,
+                progress_callback=self._on_card_generation_complete,
+                resume_from=CARD_PROGRESS_FILE,
+                mode=mode,
+                custom_prompt=custom_prompt,
+                _download_func=_download_func,
+                _generate_func=_generate_func,
+                _resize_func=_resize_func,
+                _upload_func=_upload_func,
+            )
+
+        result = _asyncio.run(_run_cards())
+
+        with self._lock:
+            self._state = "completed"
+            self._completed_asins = result.completed_asins
+            self._total_images = result.total_cards
+            self._processed_images = result.success_cards
+            self._result = result
+
+        return self._result
+
+    def _on_card_generation_complete(self, asin_result) -> None:
+        """单个 ASIN 卡片生成完成后的回调。"""
+        with self._lock:
+            self._completed_asins += 1
+            self._current_asin = asin_result.asin
+            self._total_images = getattr(self, '_total_images', 0) + len(asin_result.cards)
+            self._processed_images = getattr(self, '_processed_images', 0) + asin_result.success_count
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 后台线程执行 + 实时图片级进度追踪
+# ══════════════════════════════════════════════════════════════════════
+
+import re as _re
+
+
+def _build_initial_image_progress(
+    products: list[dict],
+) -> dict:
+    """根据产品列表构建初始进度数据，所有图片标记为 pending。
+
+    用于在后台任务启动前写入进度文件，UI 轮询时可展示完整图片列表。
+    """
+    from datetime import datetime as _dt
+
+    asin_results: dict[str, dict] = {}
+    total_images = 0
+    pending_asins: list[str] = []
+
+    for p in products:
+        asin = p.get("asin", "")
+        if not asin:
+            continue
+        pending_asins.append(asin)
+
+        urls = [u.strip() for u in _re.split(r'[;|]', p.get("图片url", "")) if u.strip()]
+        images = []
+        for idx, url in enumerate(urls):
+            images.append({
+                "index": idx,
+                "original_url": url,
+                "status": "pending",
+                "r2_url": "",
+                "error": "",
+            })
+            total_images += 1
+
+        asin_results[asin] = {
+            "asin": asin,
+            "images": images,
+        }
+
+    return {
+        "state": "running",
+        "completed_asins": [],
+        "pending_asins": pending_asins,
+        "current_asin": "",
+        "total_asins": len(products),
+        "total_images": total_images,
+        "processed_images": 0,
+        "asin_results": asin_results,
+        "started_at": _dt.now().isoformat(),
+        "updated_at": _dt.now().isoformat(),
+    }
+
+
+def _serialize_asin_image_result(asin_result) -> dict:
+    """将 AsinImageResult 序列化为字典（传统管线）。"""
+    images = []
+    for img in asin_result.images:
+        images.append({
+            "index": img.index,
+            "original_url": img.original_url,
+            "status": img.status,
+            "r2_url": img.r2_url,
+            "error": img.error,
+        })
+    return {
+        "asin": asin_result.asin,
+        "images": images,
+    }
+
+
+def _serialize_asin_card_result(asin_result) -> dict:
+    """将 AsinCardResult 序列化为字典（AI 管线）。"""
+    cards = []
+    for card in asin_result.cards:
+        cards.append({
+            "index": card.index,
+            "original_url": card.original_url,
+            "status": card.status,
+            "r2_url": card.r2_url,
+            "error": card.error,
+        })
+    return {
+        "asin": asin_result.asin,
+        "images": cards,
+    }
+
+
+def _update_progress_with_asin(
+    progress_file: str,
+    asin_data: dict,
+) -> None:
+    """原子更新进度文件：将已完成 ASIN 的结果写入，重算计数。"""
+    import json as _json
+    from datetime import datetime as _dt
+
+    try:
+        if os.path.isfile(progress_file):
+            with open(progress_file, "r", encoding="utf-8") as f:
+                progress = _json.load(f)
+        else:
+            progress = {}
+    except (_json.JSONDecodeError, OSError):
+        progress = {}
+
+    asin = asin_data["asin"]
+    asin_results = progress.get("asin_results", {})
+    asin_results[asin] = asin_data
+
+    # 重算计数
+    total_images = 0
+    processed_images = 0
+    for ar in asin_results.values():
+        for img in ar.get("images", []):
+            total_images += 1
+            if img["status"] != "pending":
+                processed_images += 1
+
+    completed_asins = [
+        a for a, ar in asin_results.items()
+        if all(img["status"] != "pending" for img in ar.get("images", []))
+    ]
+
+    progress["state"] = "running"
+    progress["asin_results"] = asin_results
+    progress["completed_asins"] = completed_asins
+    progress["current_asin"] = asin
+    progress["total_images"] = total_images
+    progress["processed_images"] = processed_images
+    progress["updated_at"] = _dt.now().isoformat()
+
+    _atomic_write_json(progress_file, progress)
+
+
+def read_progress(progress_file: str) -> dict | None:
+    """安全读取进度文件，返回字典或 None。"""
+    import json as _json
+
+    try:
+        if not os.path.isfile(progress_file):
+            return None
+        with open(progress_file, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except (_json.JSONDecodeError, OSError):
+        return None
+
+
+def start_background_translation(
+    products: list[dict],
+    font_config=None,
+    *,
+    progress_file: str = "image_progress.json",
+) -> None:
+    """在后台 daemon 线程中启动传统管线图片翻译。
+
+    主线程可通过 read_progress(progress_file) 轮询进度，
+    进度文件中包含每张图片的实时状态（pending/ok/error/skipped/video）。
+    """
+    import asyncio as _asyncio
+    from datetime import datetime as _dt
+
+    from image_translator import translate_batch
+
+    # 1. 写入初始进度（所有图片标记为 pending）
+    initial = _build_initial_image_progress(products)
+    _atomic_write_json(progress_file, initial)
+
+    def _run_in_thread():
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+
+        async def _run():
+            def on_asin_complete(asin_result):
+                data = _serialize_asin_image_result(asin_result)
+                _update_progress_with_asin(progress_file, data)
+
+            result = await translate_batch(
+                products=products,
+                font_config=font_config,
+                progress_callback=on_asin_complete,
+                resume_from=progress_file,
+            )
+
+            # 写入完成状态
+            final = read_progress(progress_file) or {}
+            final["state"] = "completed"
+            final["success_count"] = result.success_images
+            final["error_count"] = result.error_images
+            final["skipped_count"] = result.skipped_images
+            final["video_count"] = result.video_images
+            final["finished_at"] = _dt.now().isoformat()
+            _atomic_write_json(progress_file, final)
+
+        try:
+            loop.run_until_complete(_run())
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=_run_in_thread, daemon=True)
+    thread.start()
+
+
+def start_background_card_generation(
+    products: list[dict],
+    *,
+    mode: str = "translate",
+    custom_prompt: str = "",
+    progress_file: str = "card_image_progress.json",
+) -> None:
+    """在后台 daemon 线程中启动 AI 管线图片生成/翻译。
+
+    主线程可通过 read_progress(progress_file) 轮询进度。
+    """
+    import asyncio as _asyncio
+    from datetime import datetime as _dt
+
+    from image_generator import generate_batch_cards
+
+    initial = _build_initial_image_progress(products)
+    _atomic_write_json(progress_file, initial)
+
+    def _run_in_thread():
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+
+        async def _run():
+            def on_asin_complete(asin_result):
+                data = _serialize_asin_card_result(asin_result)
+                _update_progress_with_asin(progress_file, data)
+
+            result = await generate_batch_cards(
+                products=products,
+                progress_callback=on_asin_complete,
+                resume_from=progress_file,
+                mode=mode,
+                custom_prompt=custom_prompt,
+            )
+
+            final = read_progress(progress_file) or {}
+            final["state"] = "completed"
+            final["success_count"] = result.success_cards
+            final["error_count"] = result.error_cards
+            final["skipped_count"] = result.skipped_cards
+            final["video_count"] = result.video_cards
+            final["finished_at"] = _dt.now().isoformat()
+            _atomic_write_json(progress_file, final)
+
+        try:
+            loop.run_until_complete(_run())
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=_run_in_thread, daemon=True)
+    thread.start()

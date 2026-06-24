@@ -9,10 +9,9 @@ echo.
 
 cd /d "%~dp0"
 
-:: 检查 .env 是否存在
+:: 检查 .env 是否存在（首次运行会自动创建）
 if not exist ".env" (
-    echo [提示] 未检测到 .env 配置文件
-    echo 请复制 .env.template 为 .env 并填入你的 API Key
+    echo [提示] .env 配置文件将在首次启动时自动创建
     echo.
 )
 

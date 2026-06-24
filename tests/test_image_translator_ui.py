@@ -23,6 +23,166 @@ def _reset_worker_manager():
 
 
 # ============================================================
+# 切片0: enrich_product_context_from_db — 从 DB 丰富产品上下文
+# ============================================================
+
+
+class TestEnrichProductContextFromDb:
+    """enrich_product_context_from_db 从数据库读取 Phase 1/2 产物。"""
+
+    def test_enriches_with_phase1_product_info(self, tmp_path):
+        """Phase 1 完成后，产品上下文含英文属性"""
+        import sqlite3
+
+        from image_translator_ui import enrich_product_context_from_db
+        from db import init_db, upsert_product
+
+        db_path = str(tmp_path / "products.db")
+        db = sqlite3.connect(db_path)
+        init_db(db)
+        upsert_product(db, {
+            "asin": "B0TESTDB",
+            "title": "Test Product Title",
+            "details": "Test product details",
+            "image_urls": "https://img1.jpg;https://img2.jpg",
+            "category": "Electronics",
+            "material": "Plastic",
+            "features": ["Feature A", "Feature B", "Feature C"],
+            "target_audience": "Adults",
+            "brand": "TestBrand",
+        })
+        db.close()
+
+        products = [{"asin": "B0TESTDB", "图片url": "", "product_context": {}}]
+        enriched = enrich_product_context_from_db(products, db_path)
+
+        ctx = enriched[0]["product_context"]
+        assert ctx["标题"] == "Test Product Title"
+        assert ctx["详情"] == "Test product details"
+        assert ctx["product_category"] == "Electronics"
+        assert ctx["material"] == "Plastic"
+        assert "Feature A" in ctx["features"]
+        assert ctx["target_audience"] == "Adults"
+        assert ctx["brand"] == "TestBrand"
+
+    def test_enriches_with_phase2_translation(self, tmp_path):
+        """Phase 2 完成后，产品上下文含俄语文案"""
+        import sqlite3
+
+        from image_translator_ui import enrich_product_context_from_db
+        from db import init_db, upsert_product, upsert_translation
+
+        db_path = str(tmp_path / "products.db")
+        db = sqlite3.connect(db_path)
+        init_db(db)
+        upsert_product(db, {
+            "asin": "B0TRANS",
+            "title": "Product",
+            "details": "Details",
+            "image_urls": "https://img1.jpg",
+        })
+        upsert_translation(db, {
+            "asin": "B0TRANS",
+            "russian_title": "Название продукта",
+            "core_keywords": "ключевые слова",
+            "russian_description": "Описание продукта",
+        })
+        db.close()
+
+        products = [{"asin": "B0TRANS", "图片url": "", "product_context": {}}]
+        enriched = enrich_product_context_from_db(products, db_path)
+
+        ctx = enriched[0]["product_context"]
+        assert ctx["俄语标题"] == "Название продукта"
+        assert ctx["核心流量词"] == "ключевые слова"
+        assert ctx["俄语详情"] == "Описание продукта"
+
+    def test_db_values_override_excel_values(self, tmp_path):
+        """数据库中的字段值覆盖 Excel 中的同名字段"""
+        import sqlite3
+
+        from image_translator_ui import enrich_product_context_from_db
+        from db import init_db, upsert_product, upsert_translation
+
+        db_path = str(tmp_path / "products.db")
+        db = sqlite3.connect(db_path)
+        init_db(db)
+        upsert_product(db, {
+            "asin": "B0OVERRIDE",
+            "title": "DB Title",
+            "details": "DB Details",
+        })
+        upsert_translation(db, {
+            "asin": "B0OVERRIDE",
+            "russian_title": "DB Русский",
+            "core_keywords": "DB Keywords",
+            "russian_description": "DB Описание",
+        })
+        db.close()
+
+        # Excel 中有旧值，DB 中有新值
+        products = [{
+            "asin": "B0OVERRIDE",
+            "图片url": "",
+            "product_context": {
+                "标题": "Old Excel Title",
+                "俄语标题": "Old Excel Russian",
+            },
+        }]
+        enriched = enrich_product_context_from_db(products, db_path)
+
+        ctx = enriched[0]["product_context"]
+        # DB 值覆盖 Excel 值
+        assert ctx["标题"] == "DB Title"
+        assert ctx["俄语标题"] == "DB Русский"
+
+    def test_missing_db_does_not_crash(self):
+        """数据库文件不存在时不崩溃，返回原 products"""
+        from image_translator_ui import enrich_product_context_from_db
+
+        products = [{"asin": "B0NODB", "product_context": {"标题": "Original"}}]
+        enriched = enrich_product_context_from_db(products, "nonexistent.db")
+
+        # 原产品不被修改
+        assert enriched[0]["product_context"]["标题"] == "Original"
+
+    def test_returns_same_list_for_chaining(self):
+        """返回同一列表，支持链式调用"""
+        from image_translator_ui import enrich_product_context_from_db
+
+        products = [{"asin": "B0CHAIN", "product_context": {}}]
+        result = enrich_product_context_from_db(products, "nonexistent.db")
+
+        assert result is products
+
+    def test_phase2_not_complete_only_provides_phase1(self, tmp_path):
+        """Phase 2 未完成时仅提供 Phase 1 英文属性"""
+        import sqlite3
+
+        from image_translator_ui import enrich_product_context_from_db
+        from db import init_db, upsert_product
+
+        db_path = str(tmp_path / "products.db")
+        db = sqlite3.connect(db_path)
+        init_db(db)
+        upsert_product(db, {
+            "asin": "B0P1ONLY",
+            "title": "Phase1 Title",
+            "details": "Phase1 Details",
+        })
+        db.close()
+
+        products = [{"asin": "B0P1ONLY", "product_context": {}}]
+        enriched = enrich_product_context_from_db(products, db_path)
+
+        ctx = enriched[0]["product_context"]
+        # Phase 1 字段存在
+        assert ctx["标题"] == "Phase1 Title"
+        # Phase 2 字段不存在（翻译未完成）
+        assert "俄语标题" not in ctx or ctx.get("俄语标题") == ""
+
+
+# ============================================================
 # 切片1: validate_image_upload — Excel 文件校验
 # ============================================================
 
@@ -294,3 +454,308 @@ class TestWorkerIntegration:
         status = get_worker_status()
         # 状态应为 running 或 completed
         assert status.state in ("running", "completed"), f"实际状态: {status.state}"
+
+
+# ============================================================
+# 切片4: retry_single_image — 单图重试
+# ============================================================
+
+
+class TestRetrySingleImage:
+    """retry_single_image 同步包装器。"""
+
+    def test_retry_single_image_returns_image_result(self):
+        """retry_single_image 返回有效的 ImageResult"""
+        from image_processor import FontConfig, TextRegion
+        from image_translator_ui import retry_single_image
+
+        # 构建轻量 mock 管线，绕过真实下载/OCR/上传
+        async def mock_download(url):
+            return "/tmp/test.jpg"
+
+        async def mock_ocr(local_path):
+            return [TextRegion(text="Hello", translation="", box=(10, 20, 100, 50))]
+
+        async def mock_translate(texts, product_context=None):
+            return ["привет"]
+
+        async def mock_repair(image, regions):
+            return image
+
+        async def mock_resize(image):
+            from PIL import Image
+            return Image.new("RGB", (900, 1200))
+
+        async def mock_upload(local_path, remote_key):
+            return f"https://pub-xxx.r2.dev/{remote_key}"
+
+        from unittest.mock import patch
+
+        with patch("image_translator._real_download", side_effect=mock_download), \
+             patch("image_translator._real_ocr", side_effect=mock_ocr), \
+             patch("image_translator._real_translate", side_effect=mock_translate), \
+             patch("image_translator._real_upload", side_effect=mock_upload):
+            result = retry_single_image(
+                image_url="https://example.com/img.jpg",
+                asin="B0TEST",
+                index=0,
+                font_config=FontConfig(),
+            )
+
+        assert result.status == "ok"
+        assert result.original_url == "https://example.com/img.jpg"
+        assert len(result.translated_texts) == 1
+        assert result.translated_texts[0] == "привет"
+
+    def test_retry_single_image_passes_product_context(self):
+        """retry_single_image 将 product_context 传递给翻译函数"""
+        from image_processor import FontConfig, TextRegion
+        from image_translator_ui import retry_single_image
+
+        received_context = []
+
+        async def mock_download(url):
+            return "/tmp/test.jpg"
+
+        async def mock_ocr(local_path):
+            return [TextRegion(text="Hello", translation="", box=(10, 20, 100, 50))]
+
+        async def mock_translate(texts, product_context=None):
+            received_context.append(product_context)
+            return ["привет"]
+
+        async def mock_repair(image, regions):
+            return image
+
+        async def mock_resize(image):
+            from PIL import Image
+            return Image.new("RGB", (900, 1200))
+
+        async def mock_upload(local_path, remote_key):
+            return f"https://pub-xxx.r2.dev/{remote_key}"
+
+        from unittest.mock import patch
+
+        ctx = {"俄语标题": "тест", "核心流量词": "ключ"}
+
+        with patch("image_translator._real_download", side_effect=mock_download), \
+             patch("image_translator._real_ocr", side_effect=mock_ocr), \
+             patch("image_translator._real_translate", side_effect=mock_translate), \
+             patch("image_translator._real_upload", side_effect=mock_upload):
+            retry_single_image(
+                image_url="https://example.com/img.jpg",
+                asin="B0TEST",
+                index=0,
+                font_config=FontConfig(),
+                product_context=ctx,
+            )
+
+        assert len(received_context) == 1
+        assert received_context[0] == ctx
+
+
+# ============================================================
+# 切片5: _replace_and_recount — 原地替换+计数重算
+# ============================================================
+
+
+class TestReplaceAndRecount:
+    """_replace_and_recount 原地替换 ImageResult 并重算所有计数。"""
+
+    def test_replace_error_to_ok_updates_counts(self):
+        """error→ok 替换后，Asin 和 Batch 计数都正确更新"""
+        from image_translator import AsinImageResult, BatchImageResult, ImageResult
+        from image_translator_ui import _replace_and_recount
+
+        old = ImageResult(
+            index=0,
+            original_url="url1",
+            status="error",
+            error="翻译失败",
+        )
+        batch = BatchImageResult(
+            results=[
+                AsinImageResult(
+                    asin="B0X",
+                    images=[old],
+                    success_count=0,
+                    error_count=1,
+                    skipped_count=0,
+                ),
+            ],
+            total_asins=1,
+            completed_asins=1,
+            total_images=1,
+            success_images=0,
+            error_images=1,
+            skipped_images=0,
+        )
+
+        new = ImageResult(
+            index=0,
+            original_url="url1",
+            r2_url="https://r2.dev/B0X/00_ru.jpg",
+            status="ok",
+        )
+
+        _replace_and_recount(batch, "B0X", 0, new)
+
+        # Asin 级
+        assert batch.results[0].success_count == 1
+        assert batch.results[0].error_count == 0
+        assert batch.results[0].skipped_count == 0
+        # Batch 级
+        assert batch.success_images == 1
+        assert batch.error_images == 0
+        assert batch.skipped_images == 0
+        assert batch.total_images == 1
+
+    def test_replace_skipped_to_ok_updates_counts(self):
+        """skipped→ok 替换后计数正确"""
+        from image_translator import AsinImageResult, BatchImageResult, ImageResult
+        from image_translator_ui import _replace_and_recount
+
+        old = ImageResult(
+            index=0,
+            original_url="url1",
+            status="skipped",
+            error="OCR 失败",
+        )
+        batch = BatchImageResult(
+            results=[
+                AsinImageResult(
+                    asin="B0X",
+                    images=[old],
+                    success_count=0,
+                    error_count=0,
+                    skipped_count=1,
+                ),
+            ],
+            total_images=1,
+            success_images=0,
+            error_images=0,
+            skipped_images=1,
+        )
+
+        new = ImageResult(index=0, original_url="url1", status="ok")
+
+        _replace_and_recount(batch, "B0X", 0, new)
+
+        assert batch.results[0].success_count == 1
+        assert batch.results[0].skipped_count == 0
+        assert batch.success_images == 1
+        assert batch.skipped_images == 0
+
+    def test_replace_increments_retry_count(self):
+        """替换后 retry_count 在原值基础上 +1"""
+        from image_translator import AsinImageResult, BatchImageResult, ImageResult
+        from image_translator_ui import _replace_and_recount
+
+        old = ImageResult(
+            index=0,
+            original_url="url1",
+            status="error",
+            retry_count=2,
+        )
+        batch = BatchImageResult(
+            results=[
+                AsinImageResult(
+                    asin="B0X",
+                    images=[old],
+                    success_count=0,
+                    error_count=1,
+                    skipped_count=0,
+                ),
+            ],
+            total_images=1,
+            success_images=0,
+            error_images=1,
+            skipped_images=0,
+        )
+
+        new = ImageResult(index=0, original_url="url1", status="ok")
+
+        _replace_and_recount(batch, "B0X", 0, new)
+
+        assert batch.results[0].images[0].retry_count == 3  # 2 + 1
+
+    def test_replace_multiple_asins_only_affects_target(self):
+        """两个 ASIN（各有 1 error），只重试一个，另一个不变"""
+        from image_translator import AsinImageResult, BatchImageResult, ImageResult
+        from image_translator_ui import _replace_and_recount
+
+        batch = BatchImageResult(
+            results=[
+                AsinImageResult(
+                    asin="B0A",
+                    images=[
+                        ImageResult(index=0, original_url="urlA", status="error", error="E1"),
+                    ],
+                    success_count=0,
+                    error_count=1,
+                    skipped_count=0,
+                ),
+                AsinImageResult(
+                    asin="B0B",
+                    images=[
+                        ImageResult(index=0, original_url="urlB", status="error", error="E2"),
+                    ],
+                    success_count=0,
+                    error_count=1,
+                    skipped_count=0,
+                ),
+            ],
+            total_images=2,
+            success_images=0,
+            error_images=2,
+            skipped_images=0,
+        )
+
+        new = ImageResult(index=0, original_url="urlA", status="ok")
+
+        _replace_and_recount(batch, "B0A", 0, new)
+
+        # B0A 更新了
+        assert batch.results[0].success_count == 1
+        assert batch.results[0].error_count == 0
+        # B0B 未变
+        assert batch.results[1].success_count == 0
+        assert batch.results[1].error_count == 1
+        # Batch 级：1 ok + 1 error
+        assert batch.success_images == 1
+        assert batch.error_images == 1
+        assert batch.total_images == 2
+
+
+# ============================================================
+# 切片6: _find_product_context — 按 ASIN 查找上下文
+# ============================================================
+
+
+class TestFindProductContext:
+    """_find_product_context 从产品列表查找 product_context。"""
+
+    def test_find_existing_asin_returns_context(self):
+        """ASIN 存在时返回正确的 product_context"""
+        from image_translator_ui import _find_product_context
+
+        ctx = {"标题": "Test", "俄语标题": "тест"}
+        products = [
+            {"asin": "B01", "product_context": {"标题": "Other"}},
+            {"asin": "B02", "product_context": ctx},
+            {"asin": "B03", "product_context": {}},
+        ]
+
+        result = _find_product_context(products, "B02")
+        assert result == ctx
+
+    def test_find_missing_asin_returns_none(self):
+        """ASIN 不存在时返回 None"""
+        from image_translator_ui import _find_product_context
+
+        products = [
+            {"asin": "B01", "product_context": {"标题": "Test"}},
+        ]
+
+        result = _find_product_context(products, "B99")
+        assert result is None

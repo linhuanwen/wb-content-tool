@@ -343,9 +343,16 @@ def overlay_russian_text(
     from PIL import ImageDraw
 
     w_img, h_img = image.width, image.height
-    draw = ImageDraw.Draw(image)
     # 擦除边界扩展量（OCR 框可能太紧，扩展确保完全覆盖英文）
     ERASE_MARGIN = 10
+
+    # ═══════════════════════════════════════════════════════════
+    # 阶段 0：预计算 — 从原始图片检测所有区域的背景色和布局参数
+    #
+    # 必须在任何擦除操作之前完成，否则相邻区域的擦除块会污染
+    # 彼此的背景色采样，导致检测到错误的背景色、产生可见色块。
+    # ═══════════════════════════════════════════════════════════
+    _RegionPlan: list[dict] = []  # 每个 region 的预计算结果
 
     for region in regions:
         if not region.translation:
@@ -356,45 +363,74 @@ def overlay_russian_text(
         if len(box) == 4 and all(isinstance(v, (int, float)) for v in box):
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
         else:
-            # 多顶点坐标，取包围盒
             xs = [p[0] for p in box]
             ys = [p[1] for p in box]
             x1, y1, x2, y2 = int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
-        # 步骤1: 扩展擦除区域 + 背景色填充（确保完全覆盖英文原文）
+        box_w = x2 - x1
+        box_h = y2 - y1
+
+        # 扩展擦除区域（钳制到图片边界内）
         x1e = max(0, x1 - ERASE_MARGIN)
         y1e = max(0, y1 - ERASE_MARGIN)
         x2e = min(w_img, x2 + ERASE_MARGIN)
         y2e = min(h_img, y2 + ERASE_MARGIN)
+
+        # 从原始图片检测背景色（此时图片尚未被任何擦除操作修改）
         bg_color = _detect_background_color(image, x1, y1, x2, y2)
-        draw.rectangle([x1e, y1e, x2e, y2e], fill=bg_color)
 
-        box_w = x2 - x1
-        box_h = y2 - y1
-
-        # 计算字号
+        # 计算字号和字体
         size = font_config.calculate_size(region.translation, box_w, box_h)
-
-        # 加载字体
         font = _load_font(font_config.font_name, size)
 
-        # 确定颜色
+        # 确定文字颜色
         if font_config.color_mode == "fixed":
             color = _hex_to_rgb(font_config.fixed_color)
         else:
-            # "inherit" / "auto" → 根据背景亮度自动选择黑/白，确保对比度
             color = _pick_text_color(bg_color)
 
-        # 在 box 区域内居中绘制文字
-        # 先用 textbbox 获取文字尺寸
-        bbox = draw.textbbox((0, 0), region.translation, font=font)
+        _RegionPlan.append({
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+            "box_w": box_w, "box_h": box_h,
+            "x1e": x1e, "y1e": y1e, "x2e": x2e, "y2e": y2e,
+            "bg_color": bg_color,
+            "font": font,
+            "color": color,
+            "translation": region.translation,
+        })
+
+    # ═══════════════════════════════════════════════════════════
+    # 阶段 1：统一擦除 — 所有区域先擦除原文
+    #
+    # 一次性擦除所有原文区域，避免逐区域擦除时后续区域的
+    # 原文被前面区域的扩展擦除矩形覆盖。
+    # ═══════════════════════════════════════════════════════════
+    draw = ImageDraw.Draw(image)
+    for plan in _RegionPlan:
+        draw.rectangle(
+            [plan["x1e"], plan["y1e"], plan["x2e"], plan["y2e"]],
+            fill=plan["bg_color"],
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # 阶段 2：统一绘制 — 所有俄文统一覆写
+    #
+    # 在所有原文被清除的干净画布上绘制俄文，不会出现新文字
+    # 被后续擦除操作覆盖的问题。
+    # ═══════════════════════════════════════════════════════════
+    for plan in _RegionPlan:
+        bbox = draw.textbbox((0, 0), plan["translation"], font=plan["font"])
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
 
-        # 在 box 内居中
-        text_x = x1 + (box_w - text_w) // 2
-        text_y = y1 + (box_h - text_h) // 2
+        text_x = plan["x1"] + (plan["box_w"] - text_w) // 2
+        text_y = plan["y1"] + (plan["box_h"] - text_h) // 2
 
-        draw.text((text_x, text_y), region.translation, fill=color, font=font)
+        draw.text(
+            (text_x, text_y),
+            plan["translation"],
+            fill=plan["color"],
+            font=plan["font"],
+        )
 
     return image

@@ -49,7 +49,7 @@ class TestCrawlAsinsPipeline:
 
     @pytest.mark.asyncio
     async def test_crawls_single_asin_and_returns_product(self):
-        """输入一个 ASIN，返回一个产品字典"""
+        """输入一个 ASIN，返回一个产品字典（标题/图片url/详情由 Phase 1 填充）"""
         from crawler import crawl_asins
 
         async def fake_fetch(asin):
@@ -63,9 +63,15 @@ class TestCrawlAsinsPipeline:
         assert len(products) == 1
         p = products[0]
         assert p["asin"] == "B0GVYXC124"
-        assert "5-in-1" in p["标题"]
-        assert p["图片url"]  # 非空
-        assert p["详情"]  # 非空
+        # Phase 1 替代旧 extractor.py 后，爬虫仅归档 HTML，
+        # 标题/图片url/详情由 Phase 1 AI 萃取从 HTML 中提取并写入 DB。
+        assert "asin" in p
+        assert "标题" in p
+        assert "图片url" in p
+        assert "详情" in p
+        # HTML 已存档到 html/{ASIN}.html
+        import os
+        assert os.path.isfile("html/B0GVYXC124.html")
 
     @pytest.mark.asyncio
     async def test_crawls_multiple_asins(self):
